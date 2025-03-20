@@ -1,5 +1,5 @@
 use crate::tensor::Tensor;
-
+use rayon::prelude::*;
 // get (row) vectors from a 2D table given a list of indices
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     let length = indices.size();
@@ -71,25 +71,170 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let x_shape = x.shape();
+    assert!(x_shape.len() >= 1, "x至少需要有一个维度");
+    let n  = * x_shape.last().unwrap();
+    assert_eq!(y.size(), x.size(), "x,y的元素数量必须一致");
+    assert_eq!(w.size(), n, "w的元素数量必须与x最后一维大小相等");
+
+    let x_data = x.data();
+    let y_data = unsafe{y.data_mut()};
+    let w_data = w.data();
+
+
+    let total= x.size();
+    let _batch = total / n;
+    for i in 0.._batch{
+        let mut score = 0.0;
+        for j in 0..n{
+            score += x_data[i*n+j].powf(2.0);
+        }
+        score = ( epsilon+ score / n as f32).sqrt();
+        for j in 0..n{
+            y_data[i*n+j] = w_data[j] * x_data[i*n+j] / score;
+        }
+    }
 }
+
+
+pub fn par_rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
+    let x_shape = x.shape();
+    assert!(x_shape.len() >= 1, "x至少需要有一个维度");
+    let n = *x_shape.last().unwrap();
+    assert_eq!(y.size(), x.size(), "x,y的元素数量必须一致");
+    assert_eq!(w.size(), n, "w的元素数量必须与x最后一维大小相等");
+
+    let x_data = x.data();
+    let y_data = unsafe { y.data_mut() };
+    let w_data = w.data();
+
+    let total = x.size();
+    let batch_size = total / n;
+
+    // 并行处理每个batch
+    y_data.par_chunks_exact_mut(n)
+        .zip(x_data.par_chunks_exact(n))
+        .for_each(|(y_chunk, x_chunk)| {
+            // 计算平方和的平方根
+            let sum_sq: f32 = x_chunk.iter()
+                .map(|&v| v.powi(2))
+                .sum();
+
+            let scale = 1.0 / (sum_sq / n as f32 + epsilon).sqrt();
+
+            // 并行处理每个元素
+            y_chunk.par_iter_mut()
+                .zip(x_chunk.par_iter())
+                .zip(w_data.par_iter())
+                .for_each(|((y, &x_val), &w_val)| {
+                    *y = w_val * x_val * scale;
+                });
+        });
+}
+
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size(), "Tensor shapes must match");
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
+    //获取数据切片
+    let y_data = unsafe {y.data_mut()};
+    let x_data = x.data();
 
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+
+    for i in 0..len{
+        y_data[i] *= x_data[i] * 1.0/(1.0 + (-x_data[i]).exp());
+    }
+}
+
+pub fn par_swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
+    assert!(y.size() == x.size(), "Tensor shapes must match");
+
+    //获取数据切片
+    let y_data = unsafe {y.data_mut()};
+    let x_data = x.data();
+
+
+    y_data.par_iter_mut()
+        .zip(x_data.par_iter())  // 并行 zip 操作
+        .for_each(|(y_elem, x_elem)| {
+            let sigmoid = 1.0 / (1.0 + (-*x_elem).exp());
+            *y_elem *= *x_elem * sigmoid;
+        });
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    // 维度校验（与之前相同）
+    let a_dims = a.shape();
+    let b_dims = b.shape();
+    let c_dims = c.shape();
+    assert_eq!(a_dims.len(), 2, "A must be 2D matrix");
+    assert_eq!(b_dims.len(), 2, "B must be 2D matrix");
+    assert_eq!(c_dims.len(), 2, "C must be 2D matrix");
+    assert_eq!(a_dims[1], b_dims[1], "A.cols must == B.cols");
+    assert_eq!(c_dims[0], a_dims[0], "C.rows must == A.rows");
+    assert_eq!(c_dims[1], b_dims[0], "C.cols must == B.rows");
+
+    // 获取矩阵参数
+    let len_m = a_dims[0];
+    let len_k = a_dims[1];
+    let len_n = b_dims[0];
+
+    // 获取数据切片
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe {c.data_mut()};
+    let mut s;
+    //
+    for i in 0..len_m{
+        for j in 0..len_n{
+            s= 0.;
+            for k in 0..len_k{
+                s += alpha * a_data[i*len_k+k] * b_data[j*len_k+k];
+            }
+            c_data[i*len_n+j] = s + beta * c_data[i*len_n+j];
+        }
+    }
+
+}
+
+pub fn par_matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
+    // 维度校验（与之前相同）
+    let a_dims = a.shape();
+    let b_dims = b.shape();
+    let c_dims = c.shape();
+    assert_eq!(a_dims.len(), 2, "A must be 2D matrix");
+    assert_eq!(b_dims.len(), 2, "B must be 2D matrix");
+    assert_eq!(c_dims.len(), 2, "C must be 2D matrix");
+    assert_eq!(a_dims[1], b_dims[1], "A.cols must == B.cols");
+    assert_eq!(c_dims[0], a_dims[0], "C.rows must == A.rows");
+    assert_eq!(c_dims[1], b_dims[0], "C.cols must == B.rows");
+
+    // 获取矩阵参数
+    let len_m = a_dims[0];
+    let len_k = a_dims[1];
+    let len_n = b_dims[0];
+
+    // 获取数据切片
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe {c.data_mut()};
+    let mut s;
+    //
+    for i in 0..len_m{
+        for j in 0..len_n{
+            s= 0.;
+            for k in 0..len_k{
+                s += alpha * a_data[i*len_k+k] * b_data[j*len_k+k];
+            }
+            c_data[i*len_n+j] = s + beta * c_data[i*len_n+j];
+        }
+    }
+
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -106,7 +251,7 @@ pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
     sum
 }
 
-// Sample a index from a tensor (treated as a probability vector)
+// Sample an index from a tensor (treated as a probability vector)
 pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
     assert!(x.shape()[x.shape().len() - 1] == x.size());
     if temperature <= 0. || top_k < 2 || top_p <= 0. {
@@ -176,7 +321,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
 fn test_silu() {
     let mut y = Tensor::<f32>::new(vec![2., 3., 4.], &vec![1, 3]);
     let x = Tensor::<f32>::new(vec![1., 2., 3.], &vec![1, 3]);
-    swiglu(&mut y, &x);
+    par_swiglu(&mut y, &x);
     assert!(y.close_to(
         &Tensor::<f32>::new(vec![1.4621172, 5.2847824, 11.43089], &vec![1, 3]),
         1e-3

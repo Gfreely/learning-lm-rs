@@ -101,10 +101,31 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
 
-            todo!("mlp(...)");
+            self_attention(
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv
+            );
+            OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.);
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps
+            );
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -125,7 +146,7 @@ impl Llama<f32> {
         logits
     }
 
-    pub fn generate(
+    pub fn generate_story(
         &self,
         token_ids: &[u32],
         max_len: usize,
@@ -133,29 +154,141 @@ impl Llama<f32> {
         top_k: u32,
         temperature: f32,
     ) -> Vec<u32>{
+
         let mut result = Vec::<u32>::new();
-        
-        todo!("实现文本生成");
-        
+        let mut cache = self.new_cache();
+        let mut input = Tensor::<u32>::new(Vec::from(token_ids), &vec![1, token_ids.len()]);
+        //result.extend_from_slice(token_ids);
+        loop {
+            let output = OP::random_sample(&self.forward(&input, &mut cache), top_p, top_k, temperature);
+            result.push(output);
+            if result.len() >= max_len || output == self.eos_token_id {
+                break;
+            }
+            input = Tensor::new(vec![output], &vec![1]);
+        }
+        result
+    }
+    pub fn generate_chat(
+        &self,
+        token_ids: &[u32],
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+        cache: &mut KVCache<f32>,
+    ) -> Vec<u32>{
+        let mut result = Vec::<u32>::new();
+        let mut input = Tensor::new(token_ids.to_vec(), &vec![token_ids.len()]);
+        //result.extend_from_slice(token_ids);
+
+        loop {
+            let output = OP::random_sample(&self.forward(&input, cache), top_p, top_k, temperature);
+            result.push(output);
+            if result.len() >= max_len || output == self.eos_token_id {
+                break;
+            }
+            input = Tensor::new(vec![output], &vec![1,1]);
+        }
         result
     }
 }
 
 fn self_attention(
-    hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
-    att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
-    q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
-    k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
+    hidden_states: &mut Tensor<f32>,
+    att_scores: &mut Tensor<f32>,
+    q: &Tensor<f32>,
+    k: &Tensor<f32>,
+    v: &Tensor<f32>,
     n_kv_h: usize,
     n_groups: usize,
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
-}
+    // todo!("Implement self_attention");
+    // ### 以下是你需要实现的部分
+    // score = Q @ K.T / sqrt(dim)
+    // attn = softmax(score)
+    // attn_V = attn @ V
+    // 获取底层数据切片
 
+    // score = Q @ K.T / sqrt(dim)
+    {
+        let q_data = q.data();
+        let k_data = k.data();
+        let att_data = unsafe{att_scores.data_mut()};
+
+        // 缩放因子
+        let scale_factor = 1.0 / (dqkv as f32).sqrt();
+
+        //遍历每个kv头
+        for kv_head in 0..n_kv_h{
+            //遍历每个q组
+            for group in 0..n_groups{
+                //遍历当前序列的每一个值
+                for seq_pos in 0..seq_len{
+                    for k_pos in 0..total_seq_len{
+                        let mut score =0.0;
+                        for i in 0..dqkv{
+                            let q_offset = seq_pos * n_kv_h * n_groups * dqkv
+                                + (kv_head * n_groups + group) * dqkv
+                                + i;
+                            let k_offset = k_pos * n_kv_h * dqkv
+                                + kv_head * dqkv
+                                + i;
+                            score += q_data[q_offset] * k_data[k_offset];
+                        }
+                        let att_index =  kv_head * (n_groups * seq_len * total_seq_len)
+                            + group * (seq_len * total_seq_len)
+                            + seq_pos * total_seq_len
+                            + k_pos;
+                        att_data[att_index] = score * scale_factor;
+                    }
+                }
+            }
+        }
+    }
+
+    // attn = softmax(score)
+    OP::masked_softmax(att_scores);
+
+    // attn_V = attn @ V
+    {
+        let v_data = v.data();
+        let att_data = att_scores.data();
+        let hidden_data = unsafe{hidden_states.data_mut()};
+        for i in 0..hidden_data.len() {
+            hidden_data[i] = 0.0;
+        }
+        for kv_head in 0..n_kv_h{
+            //遍历每个q组
+            for group in 0..n_groups{
+                //遍历当前序列的每一个值
+                for seq_pos in 0..seq_len {
+                    for i in 0..dqkv{
+                        let mut score = 0.0;
+                        for k_pos in 0..total_seq_len{
+                            let attn_index= kv_head * total_seq_len * seq_len * n_groups
+                                + group * total_seq_len * seq_len
+                                + seq_pos * total_seq_len
+                                + k_pos;
+                            let v_offset = k_pos * n_kv_h * dqkv
+                                + kv_head * dqkv
+                                + i ;
+                            score += att_data[attn_index] * v_data[v_offset];
+                        }
+                        let out_offset = seq_pos * n_kv_h * n_groups * dqkv
+                            + (kv_head * n_groups + group) * dqkv
+                            + i;
+                        hidden_data[out_offset] = score;
+                    }
+                }
+            }
+        }
+    }
+
+}
 fn mlp(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
@@ -167,7 +300,15 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    todo!("Implement mlp");
+
+    let shape = residual.shape();
+    assert!(shape == hidden_states.shape());
+
+    OP::rms_norm(hidden_states, &residual, &rms_w, eps);
+    OP::matmul_transb(gate, 0., &hidden_states, &w_gate, 1.);
+    OP::matmul_transb(up, 0., &hidden_states, &w_up, 1.);
+    OP::swiglu(up ,&gate);
+    OP::matmul_transb(residual, 1., &up, &w_down, 1.);
 }
 
 #[test]
