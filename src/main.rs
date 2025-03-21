@@ -5,7 +5,7 @@ mod operators;
 mod params;
 mod tensor;
 
-
+use std::time::{Instant, Duration};
 use crate::kvcache::KVCache;
 
 use std::path::PathBuf;
@@ -142,8 +142,8 @@ fn chat_mode(user_input: &str,mut cache: &mut KVCache<f32>) -> String {
     let response=tokenizer.decode(&result, true).unwrap();
     response.replace(END_MARKER, "").trim().to_string()
 }
-
 /*
+
 fn chat_mode(){
     let mut params = GenerationParams::default();
     let project_dir = env!("CARGO_MANIFEST_DIR");
@@ -154,20 +154,14 @@ fn chat_mode(){
 
     let mut cache = llama.new_cache();
 
-    // 对话模板常量
-    const SYSTEM_PROMPT: &str = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
-    const USER_PREFIX: &str = "<|im_start|>user\n";
-    const ASSISTANT_PREFIX: &str = "<|im_start|>assistant\n";
-    const END_MARKER: &str = "<|im_end|>\n";
-
 
     for turn in 0..params.max_turns {
         // 获取用户输入
-        let mut user_input = String::new();
+        //let mut user_input = String::new();
         println!("\nTurn {}\nUser:", turn + 1);
-        std::io::stdin().read_line(&mut user_input).unwrap();
-        user_input = user_input.trim().to_string();
-
+        //std::io::stdin().read_line(&mut user_input).unwrap();
+        //user_input = user_input.trim().to_string();
+        let user_input ="What do you think of weather?";
         if user_input.to_lowercase() == "exit" {
             break;
         }
@@ -198,9 +192,14 @@ fn chat_mode(){
 }
 
 fn main(){
-    chat_mode();
+    //chat_mode();
+    let start = Instant::now();
     //let response = story_mode("Once upon a time，");
     //println!("{}",response);
+    story_mode("Once upon a time,");
+    let end = Instant::now();
+    let elapsed = end.duration_since(start);
+    println!(" {:?}", elapsed);
 }
 */
 
@@ -472,3 +471,5 @@ fn main() -> iced::Result {
 
     ChatApp::run(Settings::default())
 }
+
+

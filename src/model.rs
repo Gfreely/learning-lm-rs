@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::vec;
 
+use rayon::prelude::*;
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators as OP;
@@ -194,6 +195,7 @@ impl Llama<f32> {
     }
 }
 
+
 fn self_attention(
     hidden_states: &mut Tensor<f32>,
     att_scores: &mut Tensor<f32>,
@@ -289,6 +291,27 @@ fn self_attention(
     }
 
 }
+fn par_mlp(
+    residual: &mut Tensor<f32>,
+    hidden_states: &mut Tensor<f32>,
+    gate: &mut Tensor<f32>,
+    up: &mut Tensor<f32>,
+    w_up: &Tensor<f32>,
+    w_down: &Tensor<f32>,
+    w_gate: &Tensor<f32>,
+    rms_w: &Tensor<f32>,
+    eps: f32,
+) {
+
+    let shape = residual.shape();
+    assert!(shape == hidden_states.shape());
+
+    OP::par_rms_norm(hidden_states, &residual, &rms_w, eps);
+    OP::par_matmul_transb(gate, 0., &hidden_states, &w_gate, 1.);
+    OP::par_matmul_transb(up, 0., &hidden_states, &w_up, 1.);
+    OP::par_swiglu(up ,&gate);
+    OP::par_matmul_transb(residual, 1., &up, &w_down, 1.);
+}
 fn mlp(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
@@ -310,7 +333,6 @@ fn mlp(
     OP::swiglu(up ,&gate);
     OP::matmul_transb(residual, 1., &up, &w_down, 1.);
 }
-
 #[test]
 pub fn test_mlp() {
     let seq_len = 4;

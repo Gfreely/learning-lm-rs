@@ -215,26 +215,35 @@ pub fn par_matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Te
     assert_eq!(c_dims[1], b_dims[0], "C.cols must == B.rows");
 
     // 获取矩阵参数
-    let len_m = a_dims[0];
-    let len_k = a_dims[1];
-    let len_n = b_dims[0];
+    let m = a_dims[0];
+    let k = a_dims[1];
+    let n = b_dims[0];
 
     // 获取数据切片
     let a_data = a.data();
     let b_data = b.data();
     let c_data = unsafe {c.data_mut()};
-    let mut s;
-    //
-    for i in 0..len_m{
-        for j in 0..len_n{
-            s= 0.;
-            for k in 0..len_k{
-                s += alpha * a_data[i*len_k+k] * b_data[j*len_k+k];
-            }
-            c_data[i*len_n+j] = s + beta * c_data[i*len_n+j];
-        }
-    }
+    // 并行化外层循环（行方向）
+    c_data.par_chunks_exact_mut(n)
+        .enumerate()
+        .for_each(|(i, c_row)| {
+            let a_row = &a_data[i*k..(i+1)*k];
 
+            // 遍历所有列
+            for j in 0..n {
+                let mut dot = 0.0;
+                let b_row = &b_data[j*k..(j+1)*k];
+
+                // 使用迭代器优化点积计算
+                dot = a_row.iter()
+                    .zip(b_row)
+                    .map(|(&a, &b)| a * b)
+                    .sum::<f32>() * alpha;
+
+                // 合并beta系数
+                c_row[j] = dot + beta * c_row[j];
+            }
+        });
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -254,6 +263,7 @@ pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
 // Sample an index from a tensor (treated as a probability vector)
 pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
     assert!(x.shape()[x.shape().len() - 1] == x.size());
+    let temperature = 0.;
     if temperature <= 0. || top_k < 2 || top_p <= 0. {
         return x
             .data()
@@ -333,7 +343,7 @@ fn test_rms_norm() {
     let mut y = Tensor::<f32>::new(vec![1., 2., 3., 4.], &vec![2, 2]);
     let x = Tensor::<f32>::new(vec![1., 2., 3., 4.], &vec![2, 2]);
     let w = Tensor::<f32>::new(vec![1., 2.], &vec![2]);
-    rms_norm(&mut y, &x, &w, 1e-6);
+    par_rms_norm(&mut y, &x, &w, 1e-6);
     assert!(y.close_to(
         &Tensor::<f32>::new(
             vec![0.6324554, 2.5298216, 0.8485281, 2.2627416],
@@ -348,7 +358,7 @@ fn test_matmul_transb() {
     let mut c = Tensor::<f32>::new(vec![1., 2., 3., 4.], &vec![2, 2]);
     let a = Tensor::<f32>::new(vec![1., 2., 3., 4., 5., 6.], &vec![2, 3]);
     let b = Tensor::<f32>::new(vec![1., 2., 3., 4., 5., 6.], &vec![2, 3]);
-    matmul_transb(&mut c, 1., &a, &b, 1.);
+    par_matmul_transb(&mut c, 1., &a, &b, 1.);
     assert!(c.close_to(
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
